@@ -29,6 +29,14 @@ Examples:
   XTC_FILE=md_200ns.xtc TOP_FILE=md_200ns.tpr \\
     $(basename "$0") ./replica_1 --stride 10
 
+PBC preprocessing:
+  By default the container uses GROMACS 2025.4 to create
+  rep*_md_rmsd_prepared.xtc with:
+    1) trjconv -pbc nojump
+    2) trjconv -center -pbc mol -ur compact
+  The prepared XTC is cached and reused on later runs.
+  Use --rebuild-pbc to regenerate it or --no-gmx-pbc to disable this step.
+
 Parallel RMSD calculation:
   By default the Python script uses up to 8 worker processes.
   Override it either with --workers N or with RMSD_WORKERS=N.
@@ -202,6 +210,7 @@ docker run --rm \
     -e OPENBLAS_NUM_THREADS=1 \
     -e MKL_NUM_THREADS=1 \
     -e NUMEXPR_NUM_THREADS=1 \
+    -e GMX_MAXBACKUP=-1 \
     -v "$DATA_DIR:/data:rw" \
     "$IMAGE" \
     "/data/$XTC" \

@@ -26,7 +26,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -74,8 +77,32 @@ def parse_args() -> argparse.Namespace:
              "0 = automatic (2 x workers)."
     )
     p.add_argument(
+        "--gmx-pbc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Preprocess the trajectory with GROMACS trjconv before RMSD: "
+             "-pbc nojump, then -center -pbc mol -ur compact (default: enabled). "
+             "Disable with --no-gmx-pbc."
+    )
+    p.add_argument(
+        "--gmx-bin", default="gmx",
+        help='GROMACS wrapper executable (default: "gmx").'
+    )
+    p.add_argument(
+        "--center-group", default="Protein",
+        help='GROMACS index group used for centering (default: "Protein").'
+    )
+    p.add_argument(
+        "--output-group", default="System",
+        help='GROMACS index group written to the prepared XTC (default: "System").'
+    )
+    p.add_argument(
+        "--rebuild-pbc", action="store_true",
+        help="Force regeneration of the GROMACS-prepared trajectory even if a current cached file exists."
+    )
+    p.add_argument(
         "--no-unwrap", action="store_true",
-        help="Do not try to unwrap the protein using bond information."
+        help="When GROMACS preprocessing is disabled/unavailable, do not try MDAnalysis bond-based unwrapping."
     )
     p.add_argument(
         "--nskip", type=int, default=0,
@@ -152,6 +179,165 @@ def discover_topology(xtc: Path) -> Path:
         + ". Supply the desired file with --top."
     )
 
+
+
+def _run_command(cmd: list[str], stdin_text: str | None = None) -> subprocess.CompletedProcess:
+    """Run a subprocess quietly; include useful diagnostics if it fails."""
+    proc = subprocess.run(
+        cmd,
+        input=stdin_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-60:])
+        raise RuntimeError(
+            "Command failed (exit code %d):\n  %s\n\nLast output:\n%s"
+            % (proc.returncode, " ".join(cmd), tail)
+        )
+    return proc
+
+
+def _index_group_numbers(index_file: Path) -> dict[str, int]:
+    """Return {group_name: zero-based group number} from a GROMACS .ndx file."""
+    groups: dict[str, int] = {}
+    group_number = 0
+    for line in index_file.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            name = line[1:-1].strip()
+            groups[name] = group_number
+            group_number += 1
+    return groups
+
+
+def prepare_trajectory_with_gromacs(
+    topology: Path,
+    xtc: Path,
+    gmx_bin: str,
+    center_group: str,
+    output_group: str,
+    rebuild: bool,
+) -> tuple[Path, dict]:
+    """
+    Remove common PBC artifacts and center the system using GROMACS 2025.x.
+
+    Pipeline:
+      1) trjconv -pbc nojump
+      2) trjconv -center -pbc mol -ur compact
+
+    The final trajectory contains output_group (System by default) and is cached
+    next to the source trajectory as <stem>_rmsd_prepared.xtc.
+    """
+    if topology.suffix.lower() != ".tpr":
+        raise RuntimeError(
+            "GROMACS PBC preprocessing requires a .tpr topology so molecule "
+            f"definitions are available; received {topology.name}."
+        )
+
+    gmx_path = shutil.which(gmx_bin)
+    if gmx_path is None:
+        raise RuntimeError(
+            f"GROMACS executable {gmx_bin!r} was not found in PATH. "
+            "Use --no-gmx-pbc to disable preprocessing."
+        )
+
+    prepared = xtc.with_name(xtc.stem + "_rmsd_prepared.xtc")
+    newest_input = max(xtc.stat().st_mtime, topology.stat().st_mtime)
+    if (
+        prepared.exists()
+        and not rebuild
+        and prepared.stat().st_size > 0
+        and prepared.stat().st_mtime >= newest_input
+    ):
+        print(f"PBC preprocessing: using cached {prepared.name}")
+        return prepared, {
+            "enabled": True,
+            "performed": False,
+            "cached": True,
+            "gmx_binary": gmx_path,
+            "prepared_trajectory": str(prepared),
+            "center_group": center_group,
+            "output_group": output_group,
+        }
+
+    print("PBC preprocessing with GROMACS:")
+    print("  stage 1/2: -pbc nojump")
+    print("  stage 2/2: -center -pbc mol -ur compact")
+
+    with tempfile.TemporaryDirectory(prefix="rmsd_pbc_", dir=str(xtc.parent)) as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
+        ndx = tmpdir / "default.ndx"
+        nojump = tmpdir / "nojump.xtc"
+        prepared_tmp = tmpdir / "prepared.xtc"
+
+        # Generate the standard groups directly from the TPR, then map group
+        # names to numeric IDs. This avoids assuming that Protein is always #1.
+        _run_command(
+            [gmx_path, "make_ndx", "-f", str(topology), "-o", str(ndx)],
+            stdin_text="q\n",
+        )
+        groups = _index_group_numbers(ndx)
+        missing = [g for g in (center_group, output_group) if g not in groups]
+        if missing:
+            available = ", ".join(groups.keys())
+            raise RuntimeError(
+                "Required GROMACS index group(s) not found: "
+                + ", ".join(missing)
+                + f". Available groups: {available}"
+            )
+
+        center_id = groups[center_group]
+        output_id = groups[output_group]
+
+        # nojump makes the trajectory continuous. The TPR supplies the starting
+        # configuration and molecular definitions.
+        _run_command(
+            [
+                gmx_path, "trjconv",
+                "-s", str(topology),
+                "-f", str(xtc),
+                "-n", str(ndx),
+                "-o", str(nojump),
+                "-pbc", "nojump",
+            ],
+            stdin_text=f"{output_id}\n",
+        )
+
+        # Center the selected protein group and put molecular COMs back in a
+        # compact representation of the unit cell.
+        _run_command(
+            [
+                gmx_path, "trjconv",
+                "-s", str(topology),
+                "-f", str(nojump),
+                "-n", str(ndx),
+                "-o", str(prepared_tmp),
+                "-center",
+                "-pbc", "mol",
+                "-ur", "compact",
+            ],
+            stdin_text=f"{center_id}\n{output_id}\n",
+        )
+
+        if not prepared_tmp.exists() or prepared_tmp.stat().st_size == 0:
+            raise RuntimeError("GROMACS preprocessing finished without producing a valid XTC.")
+
+        # Atomic replacement prevents a partially written cached XTC from being
+        # mistaken for a completed one after an interrupted run.
+        os.replace(prepared_tmp, prepared)
+
+    print(f"PBC-prepared trajectory: {prepared}")
+    return prepared, {
+        "enabled": True,
+        "performed": True,
+        "cached": False,
+        "gmx_binary": gmx_path,
+        "prepared_trajectory": str(prepared),
+        "center_group": center_group,
+        "output_group": output_group,
+    }
 
 def add_unwrap_if_possible(u: mda.Universe, label: str) -> bool:
     """Unwrap bonded protein fragments; return True if transformation was added."""
@@ -465,19 +651,46 @@ def make_plot(
 
 def main() -> int:
     args = parse_args()
-    xtc = args.xtc.resolve()
-    if not xtc.exists():
-        raise FileNotFoundError(xtc)
+    original_xtc = args.xtc.resolve()
+    if not original_xtc.exists():
+        raise FileNotFoundError(original_xtc)
 
-    topology = args.top.resolve() if args.top is not None else discover_topology(xtc)
+    topology = args.top.resolve() if args.top is not None else discover_topology(original_xtc)
     if not topology.exists():
         raise FileNotFoundError(topology)
 
-    prefix = args.prefix if args.prefix is not None else xtc.with_suffix("")
+    # Keep result names based on the original production trajectory even when
+    # RMSD is calculated from a GROMACS-prepared cached trajectory.
+    prefix = args.prefix if args.prefix is not None else original_xtc.with_suffix("")
     prefix = prefix.resolve()
     prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Trajectory : {xtc}")
+    xtc = original_xtc
+    pbc_info = {
+        "enabled": False,
+        "performed": False,
+        "cached": False,
+        "prepared_trajectory": None,
+    }
+    if args.gmx_pbc:
+        try:
+            xtc, pbc_info = prepare_trajectory_with_gromacs(
+                topology=topology,
+                xtc=original_xtc,
+                gmx_bin=args.gmx_bin,
+                center_group=args.center_group,
+                output_group=args.output_group,
+                rebuild=args.rebuild_pbc,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"GROMACS PBC preprocessing failed: {exc}\n"
+                "If you intentionally want the old MDAnalysis-only behavior, rerun with --no-gmx-pbc."
+            ) from exc
+
+    print(f"Trajectory : {original_xtc}")
+    if xtc != original_xtc:
+        print(f"RMSD input : {xtc}")
     print(f"Topology   : {topology}")
     print(f"Selection  : {args.selection}")
     print(f"Workers    : {args.workers}")
@@ -493,7 +706,7 @@ def main() -> int:
             selection=args.selection,
             ref_frame=args.ref_frame,
             stride=args.stride,
-            do_unwrap=not args.no_unwrap,
+            do_unwrap=(not args.no_unwrap) and (not args.gmx_pbc),
             workers=args.workers,
             parts=args.parts,
         )
@@ -515,7 +728,7 @@ def main() -> int:
                 selection=args.selection,
                 ref_frame=args.ref_frame,
                 stride=args.stride,
-                do_unwrap=not args.no_unwrap,
+                do_unwrap=(not args.no_unwrap) and (not args.gmx_pbc),
                 workers=args.workers,
                 parts=args.parts,
             )
@@ -574,8 +787,10 @@ def main() -> int:
 
     summary = {
         "input": {
-            "trajectory": str(xtc),
+            "trajectory": str(original_xtc),
+            "analyzed_trajectory": str(xtc),
             "topology": str(topology),
+            "gromacs_pbc_preprocessing": pbc_info,
             "selection": args.selection,
             "selected_atoms": n_selected,
             "reference_frame": args.ref_frame,
@@ -583,7 +798,7 @@ def main() -> int:
             "workers": args.workers,
             "parts": args.parts if args.parts > 0 else (2 * args.workers if args.workers > 1 else 1),
             "rmsd_backend": "multiprocessing" if args.workers > 1 else "serial",
-            "automatic_unwrap_enabled": not args.no_unwrap,
+            "automatic_unwrap_enabled": (not args.no_unwrap) and (not args.gmx_pbc),
             "automatic_unwrap_succeeded": unwrapped,
         },
         "rmsd": {
@@ -648,8 +863,10 @@ def main() -> int:
     lines = [
         "RMSD PLATEAU ANALYSIS",
         "=====================",
-        f"Trajectory: {xtc}",
+        f"Trajectory: {original_xtc}",
+        f"RMSD input: {xtc}",
         f"Topology:   {topology}",
+        f"GROMACS PBC preprocessing: {args.gmx_pbc}",
         f"Selection:  {args.selection} ({n_selected} atoms)",
         "",
         "STEP 1 — plateau/equilibration detection",

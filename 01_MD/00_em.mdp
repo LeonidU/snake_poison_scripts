@@ -1,0 +1,46 @@
+; Energy minimization for a solvated protein-protein complex
+integrator                = steep
+emtol                     = 100.0      ; kJ mol^-1 nm^-1
+emstep                    = 0.01       ; nm
+nsteps                    = 50000
+
+continuation              = no
+
+; Output
+nstenergy                 = 100
+nstlog                    = 100
+
+; Periodic boundary conditions and non-bonded interactions
+cutoff-scheme            = Verlet
+nstlist                  = 20
+verlet-buffer-tolerance  = 0.005
+pbc                      = xyz
+
+coulombtype              = PME
+rcoulomb                 = 1.0
+epsilon-r                = 1
+fourierspacing           = 0.12
+pme-order                = 4
+ewald-rtol               = 1e-5
+
+vdwtype                  = Cut-off
+vdw-modifier             = Potential-shift-Verlet
+rvdw                     = 1.0
+DispCorr                  = EnerPres
+
+; Bond constraints: suitable for a 2 fs time step
+constraints              = h-bonds
+constraint-algorithm      = LINCS
+lincs-order              = 4
+lincs-iter               = 1
+lincs-warnangle          = 30
+
+
+; No temperature or pressure coupling during minimization
+tcoupl                    = no
+pcoupl                    = no
+
+; Center-of-mass motion
+comm-mode                 = Linear
+nstcomm                   = 100
+comm-grps                 = System

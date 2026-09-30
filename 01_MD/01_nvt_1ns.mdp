@@ -1,0 +1,63 @@
+; Replica 1: restrained NVT equilibration, 1 ns
+define                    = -DPOSRES
+
+integrator                = md
+dt                        = 0.002      ; ps
+nsteps                    = 500000     ; 1 ns
+
+continuation              = no
+gen-vel                   = yes
+gen-temp                  = 310
+gen-seed                  = 173341
+ld-seed                   = 173341
+
+; Temperature coupling
+tcoupl                    = V-rescale
+tc-grps                   = System
+tau-t                     = 1.0
+ref-t                     = 310
+
+; Fixed volume
+pcoupl                    = no
+
+; Center-of-mass motion
+comm-mode                 = Linear
+nstcomm                   = 100
+comm-grps                 = System
+
+; Output
+nstcalcenergy             = 100
+nstenergy                 = 1000       ; every 2 ps
+nstlog                    = 5000       ; every 10 ps
+nstxout                   = 0
+nstvout                   = 0
+nstfout                   = 0
+nstxout-compressed        = 5000       ; every 10 ps
+compressed-x-precision    = 1000
+compressed-x-grps         = System
+
+; Periodic boundary conditions and non-bonded interactions
+cutoff-scheme            = Verlet
+nstlist                  = 20
+verlet-buffer-tolerance  = 0.005
+pbc                      = xyz
+
+coulombtype              = PME
+rcoulomb                 = 1.0
+epsilon-r                = 1
+fourierspacing           = 0.12
+pme-order                = 4
+ewald-rtol               = 1e-5
+
+vdwtype                  = Cut-off
+vdw-modifier             = Potential-shift-Verlet
+rvdw                     = 1.0
+DispCorr                  = EnerPres
+
+; Bond constraints: suitable for a 2 fs time step
+constraints              = h-bonds
+constraint-algorithm      = LINCS
+lincs-order              = 4
+lincs-iter               = 1
+lincs-warnangle          = 30
+
