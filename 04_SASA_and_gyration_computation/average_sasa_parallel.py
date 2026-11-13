@@ -23,6 +23,7 @@ replica/conf directories can be analyzed in parallel with --workers N.
 
 Outputs (ROOT/sasa_ensemble by default):
     SASA_per_replica.csv
+    SASA_skipped_replicas.csv   (only if any replica is skipped)
     SASA_by_conformation.csv
     SASA_summary.txt
 
@@ -64,6 +65,11 @@ TOP_PATTERNS = (
     "*.gro",
     "*.pdb",
 )
+
+
+class NonFiniteSASAError(RuntimeError):
+    """Raised when a replica contains NaN or infinite SASA values."""
+    pass
 
 
 def natural_key(value: str | Path):
@@ -182,7 +188,11 @@ def analyze_run(
     if sasa.size == 0:
         raise RuntimeError(f"No SASA values were produced for {run_dir}")
     if not np.all(np.isfinite(sasa)):
-        raise RuntimeError(f"Non-finite SASA values detected for {run_dir}")
+        bad = np.count_nonzero(~np.isfinite(sasa))
+        raise NonFiniteSASAError(
+            f"Non-finite SASA values detected for {run_dir} "
+            f"({bad}/{sasa.size} analyzed frames)"
+        )
 
     row = {
         "directory": run_dir.name,
@@ -298,17 +308,34 @@ def main():
     print(f"Found {len(run_dirs)} replica/conf directories")
 
     rows = []
+    skipped_rows = []
 
     if args.workers == 1:
         # Serial mode; useful for debugging and for storage with poor parallel I/O.
         for run_dir in run_dirs:
-            rows.append(
-                analyze_run(
-                    run_dir=run_dir,
-                    selection=args.selection,
-                    stride=args.stride,
+            try:
+                rows.append(
+                    analyze_run(
+                        run_dir=run_dir,
+                        selection=args.selection,
+                        stride=args.stride,
+                    )
                 )
-            )
+            except NonFiniteSASAError as exc:
+                print(
+                    f"WARNING: {exc}. Replica {run_dir.name} will be ignored.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                replica, conf = parse_run_name(run_dir)
+                skipped_rows.append(
+                    {
+                        "directory": run_dir.name,
+                        "replica": replica,
+                        "conf": conf,
+                        "reason": str(exc),
+                    }
+                )
     else:
         n_workers = min(args.workers, len(run_dirs))
         print(f"Parallel mode: {n_workers} worker processes")
@@ -336,9 +363,30 @@ def main():
                 run_dir = future_to_run[future]
                 try:
                     row = future.result()
+                except NonFiniteSASAError as exc:
+                    print(
+                        f"WARNING: {exc}. Replica {run_dir.name} will be ignored.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    replica, conf = parse_run_name(run_dir)
+                    skipped_rows.append(
+                        {
+                            "directory": run_dir.name,
+                            "replica": replica,
+                            "conf": conf,
+                            "reason": str(exc),
+                        }
+                    )
+                    completed += 1
+                    print(
+                        f"Completed {completed}/{len(run_dirs)}: {run_dir.name} SKIPPED",
+                        flush=True,
+                    )
+                    continue
                 except Exception as exc:
-                    # Scientific analysis should fail if any replica fails; silently
-                    # dropping a run would change the ensemble and its statistics.
+                    # Other failures are still treated as fatal because they can
+                    # indicate a broken topology/trajectory or another real problem.
                     for other in future_to_run:
                         other.cancel()
                     raise RuntimeError(
@@ -357,11 +405,21 @@ def main():
         # replica/conf ordering in CSV files and summaries.
         rows.sort(key=lambda row: (row["conf"], row["replica"], row["directory"]))
 
+    if not rows:
+        raise RuntimeError(
+            "No replicas with finite SASA values were available for the ensemble summary."
+        )
+
     output_dir = root / args.output
     output_dir.mkdir(parents=True, exist_ok=True)
 
     per_replica_csv = output_dir / "SASA_per_replica.csv"
     write_csv(per_replica_csv, rows)
+
+    skipped_csv = output_dir / "SASA_skipped_replicas.csv"
+    if skipped_rows:
+        skipped_rows.sort(key=lambda row: (row["conf"], row["replica"], row["directory"]))
+        write_csv(skipped_csv, skipped_rows)
 
     # ------------------------------------------------------------------
     # Per-conformation summaries: each MD replica contributes one value.
@@ -407,6 +465,7 @@ def main():
     print("ENSEMBLE SASA SUMMARY")
     print("=" * 78)
     print(f"Replicas analyzed       : {overall['n']}")
+    print(f"Replicas skipped        : {len(skipped_rows)}")
     print(f"Starting conformations  : {len(conf_rows)}")
     print(f"Mean of replica means   : {overall['mean']:.3f} A^2")
     print(f"SD between replicas     : {overall['sd']:.3f} A^2")
@@ -426,6 +485,7 @@ def main():
         handle.write(f"stride = {args.stride}\n")
         handle.write(f"workers = {args.workers}\n")
         handle.write(f"replicas = {overall['n']}\n")
+        handle.write(f"replicas_skipped_nonfinite = {len(skipped_rows)}\n")
         handle.write(f"conformations = {len(conf_rows)}\n\n")
 
         handle.write("[Replica-level ensemble summary]\n")
@@ -443,6 +503,8 @@ def main():
 
     print("\nOutput:")
     print(f"  {per_replica_csv}")
+    if skipped_rows:
+        print(f"  {skipped_csv}")
     print(f"  {per_conf_csv}")
     print(f"  {summary_path}")
 
